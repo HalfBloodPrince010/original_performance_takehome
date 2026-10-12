@@ -76,12 +76,44 @@ class KernelBuilder:
 
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
-
+        """
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
             slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
             slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
             slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
+        """
+        # Stage 0 - ("+", 0x7ED55D16, "+", "<<", 12)
+        slots.append(("alu", ("*", tmp1, val_hash_addr, self.scratch_const(4097))))
+        slots.append(("alu", ("+", val_hash_addr, tmp1, self.scratch_const(0x7ED55D16))))
+        slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", 0))))
+
+        # Stage 1 - ("^", 0xC761C23C, "^", ">>", 19)
+        slots.append(("alu", ("^", tmp1, val_hash_addr, self.scratch_const(0xC761C23C))))
+        slots.append(("alu", (">>", tmp2, val_hash_addr, self.scratch_const(19))))
+        slots.append(("alu", ("^", val_hash_addr, tmp1, tmp2)))
+        slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", 1))))
+
+        # Stage 2 - ("+", 0x165667B1, "+", "<<", 5)
+        # Stage 3 - ("+", 0xD3A2646C, "^", "<<", 9)
+        # Stage 2 folded & merged with 3
+        slots.append(("alu", ("*", tmp1, val_hash_addr, self.scratch_const(33))))
+        slots.append(("alu", ("+", tmp1, tmp1, self.scratch_const(0xE9F8CC1D))))
+        slots.append(("alu", ("*", tmp2, val_hash_addr, self.scratch_const(16896))))
+        slots.append(("alu", ("+", tmp2, tmp2, self.scratch_const(0xACCF6200))))
+        slots.append(("alu", ("^", val_hash_addr, tmp1, tmp2)))
+        slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", 3))))
+
+        # Stage 4 - ("+", 0xFD7046C5, "+", "<<", 3)
+        slots.append(("alu", ("*", tmp1, val_hash_addr, self.scratch_const(9))))
+        slots.append(("alu", ("+", val_hash_addr, tmp1, self.scratch_const(0xFD7046C5))))
+        slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", 4))))
+
+        # Stage 5 - ("^", 0xB55A4F09, "^", ">>", 16)
+        slots.append(("alu", ("^", tmp1, val_hash_addr, self.scratch_const(0xB55A4F09))))
+        slots.append(("alu", (">>", tmp2, val_hash_addr, self.scratch_const(16))))
+        slots.append(("alu", ("^", val_hash_addr, tmp1, tmp2)))
+        slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", 5))))
 
         return slots
 
