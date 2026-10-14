@@ -19,7 +19,6 @@ We recommend you look through problem.py next.
 from collections import defaultdict
 import random
 import unittest
-from doctest import debug
 
 from problem import (
     Engine,
@@ -90,9 +89,9 @@ class KernelBuilder:
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
 
-        # Stage 0 - ("+", 0x7ED55D16, "+", "<<", 12)
-        slots.append(("valu", ("*", tmp1, val_hash_addr, self.scratch_vconst(4097))))
-        slots.append(("valu", ("+", val_hash_addr, tmp1, self.scratch_vconst(0x7ED55D16))))
+        # Stage 0 - ("+", 0x7ED55D16, "+", "<<", 12) folded to ("*", 4097, "+", 0x7ED55D16)
+        # val << x = val * 2^x
+        slots.append(("valu", ("multiply_add", val_hash_addr, val_hash_addr, self.scratch_vconst(4097), self.scratch_vconst(0x7ED55D16))))
         slots.append(("debug", ("vcompare", val_hash_addr, self.debug_vkeys(round, i, "hash_stage", 0))))
 
         # Stage 1 - ("^", 0xC761C23C, "^", ">>", 19)
@@ -102,18 +101,15 @@ class KernelBuilder:
         slots.append(("debug", ("vcompare", val_hash_addr, self.debug_vkeys(round, i, "hash_stage", 1))))
 
         # Stage 2 - ("+", 0x165667B1, "+", "<<", 5)
-        # Stage 3 - ("+", 0xD3A2646C, "^", "<<", 9)
         # Stage 2 folded & merged with 3
-        slots.append(("valu", ("*", tmp1, val_hash_addr, self.scratch_vconst(33))))
-        slots.append(("valu", ("+", tmp1, tmp1, self.scratch_vconst(0xE9F8CC1D))))
-        slots.append(("valu", ("*", tmp2, val_hash_addr, self.scratch_vconst(16896))))
-        slots.append(("valu", ("+", tmp2, tmp2, self.scratch_vconst(0xACCF6200))))
+        # Stage 3 - ("+", 0xD3A2646C, "^", "<<", 9)
+        slots.append(("valu", ("multiply_add", tmp1, val_hash_addr, self.scratch_vconst(33), self.scratch_vconst(0xE9F8CC1D))))
+        slots.append(("valu", ("multiply_add", tmp2, val_hash_addr, self.scratch_vconst(16896), self.scratch_vconst(0xACCF6200))))
         slots.append(("valu", ("^", val_hash_addr, tmp1, tmp2)))
         slots.append(("debug", ("vcompare", val_hash_addr, self.debug_vkeys(round, i, "hash_stage", 3))))
 
-        # Stage 4 - ("+", 0xFD7046C5, "+", "<<", 3)
-        slots.append(("valu", ("*", tmp1, val_hash_addr, self.scratch_vconst(9))))
-        slots.append(("valu", ("+", val_hash_addr, tmp1, self.scratch_vconst(0xFD7046C5))))
+        # Stage 4 - ("+", 0xFD7046C5, "+", "<<", 3)  folded to ("*", 9, "+", 0xFD7046C5)
+        slots.append(("valu", ("multiply_add", val_hash_addr, val_hash_addr, self.scratch_vconst(9), self.scratch_vconst(0xFD7046C5))))
         slots.append(("debug", ("vcompare", val_hash_addr, self.debug_vkeys(round, i, "hash_stage", 4))))
 
         # Stage 5 - ("^", 0xB55A4F09, "^", ">>", 16)
