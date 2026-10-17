@@ -19,6 +19,8 @@ We recommend you look through problem.py next.
 from collections import defaultdict
 import random
 import unittest
+from http.cookiejar import request_port
+from select import select
 
 from problem import (
     Engine,
@@ -119,6 +121,124 @@ class KernelBuilder:
         slots.append(("debug", ("vcompare", val_hash_addr, self.debug_vkeys(round, i, "hash_stage", 5))))
 
         return slots
+
+    @staticmethod
+    def report(bundles):
+        n = sum(1 for b in bundles if set(b) != {"debug"})
+        for engine, limit in SLOT_LIMITS.items():
+            if engine == "debug":
+                continue
+            used = sum(len(b.get(engine, [])) for b in bundles)
+            print(f"{engine:5s}: {used:6d} ops {used/n:5.2f}/cycle of {limit}")
+
+    @staticmethod
+    def show(bundles, start = 0, count=20):
+        for cycle in range(start, min(start+count, len(bundles))):
+            bundle = bundles[cycle]
+            print(f"cycle: {cycle:5d}: " + " ".join(
+                f"{engine}={len(bundle.get(engine,[]))}" for engine in SLOT_LIMITS.keys()
+            ))
+
+    def scheduler_fcfs(self, ops):
+        schedule = []
+        available_at = {}
+        write_after_write = {}
+        write_after_read = {}
+        for engine, instr in ops:
+            cycle = 0
+            reads, writes = self.get_operands(engine, instr)
+
+            # RAW: Are all inputs available? If not, when are they available?
+            for r in reads:
+                cycle = max(available_at.get(r, 0), cycle)
+            # WAW and WAR: Is it safe to write to w at this cycle? If not, when can we override the w?
+            for w in writes:
+                cycle = max(write_after_write.get(w, 0), cycle)
+                cycle = max(write_after_read.get(w, 0), cycle)
+
+            # In what cycle the resource is available to schedule this instr?
+            while True:
+                while len(schedule) <= cycle:
+                    schedule.append({})
+                if len(schedule[cycle].get(engine, [])) < SLOT_LIMITS[engine]:
+                    break
+                cycle += 1
+
+            # Schedule the operation in this @cycle
+            schedule[cycle].setdefault(engine, []).append(instr)
+
+            # Record
+            for w in writes:
+                # RAW: w value can be readable at cycle + 1, after instr complete at cycle
+                available_at[w] = cycle + 1
+                # WAW: similarly, we can write to w value at cycle + 1
+                write_after_write[w] = cycle + 1
+            for r in reads:
+                # WAR: we can write after read in the same cycle, because read happens at the
+                # start of the cycle. But there are other instruction reading operands. We
+                # can only write after all read are finished. Hence,
+                # we need to consider max for each read.
+                write_after_read[r] = max(write_after_read.get(r, 0), cycle)
+
+        return schedule
+
+
+    @staticmethod
+    def get_operands(engine, instr):
+        mem = "MEM"
+
+        """
+        return [read operands], [write_operands]
+        """
+        def vector(base):
+            return range(base, base + VLEN)
+
+        match engine, instr:
+            # ALU
+            case "alu", (_, dest, a, b):
+                return [a, b], [dest]
+
+            # VALU - Vector Ops
+            case "valu", ("vbroadcast", dest, src):
+                return [src], [*vector(dest)]
+            case "valu", ("multiply_add", dest, a, b, c):
+                return [*vector(a), *vector(b), *vector(c)], [*vector(dest)]
+            case "valu", (_, dest, a, b):
+                return [*vector(a), *vector(b)], [*vector(dest)]
+
+            # LOAD
+            case "load", ("const", dest, _):
+                return [], [dest]
+            case "load", ("load", dest, addr):
+                return [addr, mem], [dest]
+            case "load", ("load_offset", dest, src, offset):
+                return [src + offset, mem], [dest + offset]
+            case "load", ("vload", dest, addr):
+                return [addr, mem], [*vector(dest)]
+
+            # STORE
+            case "store", ("store", addr, src):
+                return [src, addr], [mem]
+            case "store", ("vstore", addr, src):
+                return [addr, *vector(src)], [mem]
+
+            # FLOW
+            case "flow", ("select", dest, cond, a, b):
+                return [a, b, cond], [dest]
+            case "flow", ("vselect", dest, cond, a, b):
+                return [*vector(a), *vector(b), *vector(cond)], [*vector(dest)]
+            case "flow", ("add_imm", dest, a, imm_val):
+                return [a], [dest]
+
+            # DEBUG
+            case "debug", ("compare", loc, _key):
+                return [loc], []
+            case "debug", ("vcompare", loc, v_keys):
+                return [*vector(loc)], []
+            case "debug", _:
+                return [], []
+
+        raise NotImplementedError(f"Instructions unhandled: {engine}: {instr}")
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -224,6 +344,15 @@ class KernelBuilder:
                 body.append(("store", ("vstore", tmp_addr, tmp_val_i)))
 
         body_instrs = self.build(body)
+        print("\nReport before scheduling: \n")
+        self.report(body_instrs)
+        self.show(body_instrs, 0, 20)
+
+        body_instrs = self.scheduler_fcfs(body)
+        print("\nReport after scheduling: \n")
+        self.report(body_instrs)
+        self.show(body_instrs, 0, 20)
+
         self.instrs.extend(body_instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
