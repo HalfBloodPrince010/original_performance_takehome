@@ -290,6 +290,36 @@ class KernelBuilder:
             for block in range(n_blocks)
         ]
 
+        # Strength Reduction
+        # Original update, every round: idx' = 2 * idx + 1 + bit
+        # The "+1" costs an extra op in every round for every block, which is just a Loop Invariant Constant.
+        # We could track t instead: t' = 2*t + bit with one multiply_add
+        #
+        # t is the node's position within its level (0 .. 2^L - 1), while idx is
+        # its position in the whole tree. idx = t + gap
+        #
+        # The delta (or gap) between t and idx doubles every round and by + 1
+        # Hence, gap' = 2 * gap + 1, where initial_gap = 0
+        #
+        # As mentioned above, t tracks index at the current level
+        # And gap is essentially the number of nodes above level l.
+        # Gap @level: 0 is 0
+        # Then gap at each level using formula new_gap = 2 * old_gap + 1
+        # gap      = 0, 1, 3, 7, 14 ...
+        # gap + 1  = 1, 2, 4, 8     ... there are basically nodes at each level.
+        # gap + 1 =  2 ^ L
+        # Hence, gap = 2^L - 1.
+        forest_values_level = {}
+        for L in range(forest_height + 1):
+            gap = (1 << L) - 1
+            # forest_values_p + idx = forest_values_p + t + gap
+            # We could precompute forest_values_p + gap, and t get saved at the end
+            # instead of idx
+            forest_values_base_corrected = self.alloc_scratch(f"forest_values_p_{L}")
+            self.add("alu", ("+", forest_values_base_corrected, self.scratch[f"forest_values_p"], self.scratch_const(gap)))
+            forest_values_level[L] = self.alloc_scratch(f"v_forest_values_{L}", 8)
+            self.add("valu", ("vbroadcast", forest_values_level[L], forest_values_base_corrected))
+
         # At Round 0 and 11, all idx start at 0, we don't have to gather for every idx
         # Round 0 - Tree level = 0
         # Round 11 - Tree level =  11 = forest_height + 1, we wrap to 0.
@@ -301,9 +331,6 @@ class KernelBuilder:
         # Broadcast inp_indices_p, inp_values_p and forest_values_p pointers and n_nodes
         v_n_nodes = self.alloc_scratch("v_n_nodes", 8)
         self.add("valu", ("vbroadcast", self.scratch["v_n_nodes"], self.scratch["n_nodes"]))
-
-        v_forest_values_p = self.alloc_scratch("v_forest_values_p", 8)
-        self.add("valu", ("vbroadcast", self.scratch["v_forest_values_p"], self.scratch["forest_values_p"]))
 
         for b, r in enumerate(regs):
             block_start = b * VLEN
@@ -329,7 +356,7 @@ class KernelBuilder:
                     body.append(("debug", ("vcompare", root_vec, self.debug_vkeys(round, block_start, "node_val"))))
                     body.append(("valu", ("^", r["val"], r["val"], root_vec)))
                 else:
-                    body.append(("valu", ("+", r["node"], v_forest_values_p, r["idx"])))
+                    body.append(("valu", ("+", r["node"], forest_values_level[level], r["idx"])))
                     for offset in range(8):
                         # scratch[node + offset] = mem[scratch[node + offset]]
                         body.append(("load", ("load_offset", r["node"], r["node"], offset)))
@@ -344,14 +371,15 @@ class KernelBuilder:
                 # idx = 2*idx + (1 if val % 2 == 0 else 2) simplified to the following
                 # bit = val & 1
                 # 2*idx + 1 + bit
-                body.append(("valu", ("multiply_add", r["idx"], r["idx"], self.scratch_vconst(2), self.scratch_vconst(1))))
-                body.append(("valu", ("&", r["vtmp1"], r["val"], self.scratch_vconst(1))))
-                body.append(("valu", ("+", r["idx"], r["idx"], r["vtmp1"])))
-
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("valu", ("<", r["vtmp1"], r["idx"], v_n_nodes)))
-                body.append(("flow", ("vselect", r["idx"], r["vtmp1"], r["idx"], self.scratch_vconst(0))))
-                body.append(("debug", ("vcompare", r["idx"], self.debug_vkeys(round, block_start, "wrapped_idx"))))
+                # At Level 0: which is Round = 0 or 11
+                # save only bit because idx will be 0 anyway
+                if level == 0:
+                    body.append(("valu", ("&", r["idx"], r["val"], self.scratch_vconst(1))))
+                # Other Rounds
+                # save only t = 2 * idx + bit
+                else:
+                    body.append(("valu", ("&", r["vtmp1"], r["val"], self.scratch_vconst(1))))
+                    body.append(("valu", ("multiply_add", r["idx"], r["idx"], self.scratch_vconst(2), r["vtmp1"])))
 
         for b, r in enumerate(regs):
             block = self.scratch_const(b * VLEN)
