@@ -47,6 +47,7 @@ class KernelBuilder:
         self.scratch_ptr = 0
         self.const_map = {}
         self.vconst_map = {}
+        self.setup = []
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -76,7 +77,7 @@ class KernelBuilder:
     def scratch_const(self, val, name=None):
         if val not in self.const_map:
             addr = self.alloc_scratch(name)
-            self.add("load", ("const", addr, val))
+            self.setup.append(("load", ("const", addr, val)))
             self.const_map[val] = addr
         return self.const_map[val]
 
@@ -84,7 +85,7 @@ class KernelBuilder:
         if val not in self.vconst_map:
             src_val_scratch_addr = self.scratch_const(val)
             addr = self.alloc_scratch(name, 8)
-            self.add("valu", ("vbroadcast", addr, src_val_scratch_addr))
+            self.setup.append(("valu", ("vbroadcast", addr, src_val_scratch_addr)))
             self.vconst_map[val] = addr
         return self.vconst_map[val]
 
@@ -273,8 +274,7 @@ class KernelBuilder:
         # Any debug engine instruction is ignored by the submission simulator
         self.add("debug", ("comment", "Starting loop"))
 
-        body = []  # array of slots
-
+        # Setup
         # Scalar scratch registers
         tmp_addr = self.alloc_scratch("tmp_addr")
 
@@ -316,22 +316,19 @@ class KernelBuilder:
             # We could precompute forest_values_p + gap, and t get saved at the end
             # instead of idx
             forest_values_base_corrected = self.alloc_scratch(f"forest_values_p_{L}")
-            self.add("alu", ("+", forest_values_base_corrected, self.scratch[f"forest_values_p"], self.scratch_const(gap)))
+            self.setup.append(("alu", ("+", forest_values_base_corrected, self.scratch[f"forest_values_p"], self.scratch_const(gap))))
             forest_values_level[L] = self.alloc_scratch(f"v_forest_values_{L}", 8)
-            self.add("valu", ("vbroadcast", forest_values_level[L], forest_values_base_corrected))
+            self.setup.append(("valu", ("vbroadcast", forest_values_level[L], forest_values_base_corrected)))
 
         # At Round 0 and 11, all idx start at 0, we don't have to gather for every idx
         # Round 0 - Tree level = 0
         # Round 11 - Tree level =  11 = forest_height + 1, we wrap to 0.
         root = self.alloc_scratch("root", 1)
-        self.add("load", ("load", root, self.scratch["forest_values_p"]))
+        self.setup.append(("load", ("load", root, self.scratch["forest_values_p"])))
         root_vec = self.alloc_scratch("root_vec", 8)
-        self.add("valu", ("vbroadcast", root_vec, root))
+        self.setup.append(("valu", ("vbroadcast", root_vec, root)))
 
-        # Broadcast inp_indices_p, inp_values_p and forest_values_p pointers and n_nodes
-        v_n_nodes = self.alloc_scratch("v_n_nodes", 8)
-        self.add("valu", ("vbroadcast", self.scratch["v_n_nodes"], self.scratch["n_nodes"]))
-
+        body = []  # array of slots
         for b, r in enumerate(regs):
             block_start = b * VLEN
             block = self.scratch_const(block_start)
@@ -375,6 +372,9 @@ class KernelBuilder:
                 # save only bit because idx will be 0 anyway
                 if level == 0:
                     body.append(("valu", ("&", r["idx"], r["val"], self.scratch_vconst(1))))
+                # We don't use this value anyway as it gets wrapped the next level, and directly use root_vec
+                elif level == forest_height:
+                    pass
                 # Other Rounds
                 # save only t = 2 * idx + bit
                 else:
@@ -391,12 +391,12 @@ class KernelBuilder:
             body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], block)))
             body.append(("store", ("vstore", tmp_addr, r["val"])))
 
-        body_instrs = self.build(body)
+        body_instrs = self.build(self.setup + body)
         print("\nReport before scheduling: \n")
         self.report(body_instrs)
         self.show(body_instrs, 0, 20)
 
-        body_instrs = self.scheduler_fcfs(body)
+        body_instrs = self.scheduler_fcfs(self.setup + body)
         print("\nReport after scheduling: \n")
         self.report(body_instrs)
         self.show(body_instrs, 0, 20)
