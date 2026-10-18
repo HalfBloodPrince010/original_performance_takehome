@@ -290,6 +290,14 @@ class KernelBuilder:
             for block in range(n_blocks)
         ]
 
+        # At Round 0 and 11, all idx start at 0, we don't have to gather for every idx
+        # Round 0 - Tree level = 0
+        # Round 11 - Tree level =  11 = forest_height + 1, we wrap to 0.
+        root = self.alloc_scratch("root", 1)
+        self.add("load", ("load", root, self.scratch["forest_values_p"]))
+        root_vec = self.alloc_scratch("root_vec", 8)
+        self.add("valu", ("vbroadcast", root_vec, root))
+
         # Broadcast inp_indices_p, inp_values_p and forest_values_p pointers and n_nodes
         v_n_nodes = self.alloc_scratch("v_n_nodes", 8)
         self.add("valu", ("vbroadcast", self.scratch["v_n_nodes"], self.scratch["n_nodes"]))
@@ -316,14 +324,19 @@ class KernelBuilder:
 
                 # node_val = mem[forest_values_p + idx], gather op
                 # we can't use one pointer
-                body.append(("valu", ("+", r["node"], v_forest_values_p, r["idx"])))
-                for offset in range(8):
-                    # scratch[node + offset] = mem[scratch[node + offset]]
-                    body.append(("load", ("load_offset", r["node"], r["node"], offset)))
-                body.append(("debug", ("vcompare", r["node"], self.debug_vkeys(round, block_start, "node_val"))))
+                level = round % (forest_height + 1)
+                if level == 0:
+                    body.append(("debug", ("vcompare", root_vec, self.debug_vkeys(round, block_start, "node_val"))))
+                    body.append(("valu", ("^", r["val"], r["val"], root_vec)))
+                else:
+                    body.append(("valu", ("+", r["node"], v_forest_values_p, r["idx"])))
+                    for offset in range(8):
+                        # scratch[node + offset] = mem[scratch[node + offset]]
+                        body.append(("load", ("load_offset", r["node"], r["node"], offset)))
+                    body.append(("debug", ("vcompare", r["node"], self.debug_vkeys(round, block_start, "node_val"))))
+                    # val = myhash(val ^ node_val)
+                    body.append(("valu", ("^", r["val"], r["val"], r["node"])))
 
-                # val = myhash(val ^ node_val)
-                body.append(("valu", ("^", r["val"], r["val"], r["node"])))
                 # Node value are not used after the above op, we can re-use it as tmp2
                 body.extend(self.build_hash(r["val"], r["vtmp1"], r["node"], round, block_start))
                 body.append(("debug", ("vcompare", r["val"], self.debug_vkeys(round, block_start, "hashed_val"))))
