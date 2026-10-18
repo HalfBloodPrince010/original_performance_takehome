@@ -328,6 +328,32 @@ class KernelBuilder:
         root_vec = self.alloc_scratch("root_vec", 8)
         self.setup.append(("valu", ("vbroadcast", root_vec, root)))
 
+        # Similarly, at Round 1 and 12, we are 1 level below root, so we have either
+        # left node or right node to choose from.
+        # Using the sign bit, we can update the values as
+        # node = left_node + s * delta
+        # where delta = right_node - left_node
+        # If sign = 0,
+        #        node = left_node + 0 = left_node
+        # If sign = 1,
+        #        node = left_node + delta = right_node
+        #
+        # Left Node
+        left_node = self.alloc_scratch("left_node")
+        self.setup.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], self.scratch_const(1))))
+        self.setup.append(("load", ("load", left_node, tmp_addr)))
+        left_node_vec = self.alloc_scratch("left_node_vec", 8)
+        self.setup.append(("valu", ("vbroadcast", left_node_vec, left_node)))
+        # Right Node
+        right_node = self.alloc_scratch("right_node")
+        self.setup.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], self.scratch_const(2))))
+        self.setup.append(("load", ("load", right_node, tmp_addr)))
+        right_node_vec = self.alloc_scratch("right_node_vec", 8)
+        self.setup.append(("valu", ("vbroadcast", right_node_vec, right_node)))
+        # Delta right_node_vec - left_node_vec
+        delta_vec = self.alloc_scratch("delta", 8)
+        self.setup.append(("valu", ("-", delta_vec, right_node_vec, left_node_vec)))
+
         body = []  # array of slots
         for b, r in enumerate(regs):
             block_start = b * VLEN
@@ -352,6 +378,10 @@ class KernelBuilder:
                 if level == 0:
                     body.append(("debug", ("vcompare", root_vec, self.debug_vkeys(round, block_start, "node_val"))))
                     body.append(("valu", ("^", r["val"], r["val"], root_vec)))
+                elif level == 1:
+                    body.append(("valu", ("multiply_add", r["node"], r["idx"], delta_vec, left_node_vec)))
+                    body.append(("debug", ("vcompare", r["node"], self.debug_vkeys(round, block_start, "node_val"))))
+                    body.append(("valu", ("^", r["val"], r["val"], r["node"])))
                 else:
                     body.append(("valu", ("+", r["node"], forest_values_level[level], r["idx"])))
                     for offset in range(8):
