@@ -278,16 +278,17 @@ class KernelBuilder:
         # Scalar scratch registers
         tmp_addr = self.alloc_scratch("tmp_addr")
 
-        # Vector scratch registers
-        tmp_idx_i = self.alloc_scratch("tmp_idx_i", 8)
-        tmp_val_i = self.alloc_scratch("tmp_val_i", 8)
-        tmp_node_val_i = self.alloc_scratch("tmp_node_val_i", 8)
-        tmp_addr_i = self.alloc_scratch("tmp_addr_i", 8)
-
-        # Vector tmp
-        vtmp1 = self.alloc_scratch("vtmp1", 8)
-        vtmp2 = self.alloc_scratch("vtmp2", 8)
-        vtmp3 = self.alloc_scratch("vtmp3", 8)
+        n_blocks:int  = batch_size // VLEN
+        # Vector scratch registers for each block
+        # batch_size // VLEN = 256 // 8 = 32 blocks
+        # 32 * 32 = 1024 scratch cells
+        regs = [{
+            "idx" : self.alloc_scratch(f"idx_{block}", 8),
+            "val" : self.alloc_scratch(f"val_{block}", 8),
+            "node" : self.alloc_scratch(f"node_{block}", 8),
+            "vtmp1": self.alloc_scratch(f"tmp_{block}", 8)}
+            for block in range(n_blocks)
+        ]
 
         # Broadcast inp_indices_p, inp_values_p and forest_values_p pointers and n_nodes
         v_n_nodes = self.alloc_scratch("v_n_nodes", 8)
@@ -296,52 +297,58 @@ class KernelBuilder:
         v_forest_values_p = self.alloc_scratch("v_forest_values_p", 8)
         self.add("valu", ("vbroadcast", self.scratch["v_forest_values_p"], self.scratch["forest_values_p"]))
 
+        for b, r in enumerate(regs):
+            block_start = b * VLEN
+            block = self.scratch_const(block_start)
+            # idx = mem[inp_indices_p + block_start]
+            body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], block)))
+            body.append(("load", ("vload", r["idx"], tmp_addr)))
+            body.append(("debug", ("vcompare", r["idx"], self.debug_vkeys(0, block_start, "idx"))))
+
+            # val = mem[inp_values_p + block_start]
+            body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], block)))
+            body.append(("load", ("vload", r["val"], tmp_addr)))
+            body.append(("debug", ("vcompare", r["val"], self.debug_vkeys(0, block_start, "val"))))
+
         for round in range(rounds):
-            for i in range(0, batch_size, 8):
-                i_const = self.scratch_const(i)
-
-                # idx = mem[inp_indices_p + i], loads are continuous from the tmp_addr. So, we don't need valu here.
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("vload", tmp_idx_i, tmp_addr)))
-                body.append(("debug", ("vcompare", tmp_idx_i, self.debug_vkeys(round, i, "idx"))))
-
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("vload", tmp_val_i, tmp_addr)))
-                body.append(("debug", ("vcompare", tmp_val_i, self.debug_vkeys(round, i, "val"))))
+            for b, r in enumerate(regs):
+                block_start = b * VLEN
 
                 # node_val = mem[forest_values_p + idx], gather op
                 # we can't use one pointer
-                body.append(("valu", ("+", tmp_addr_i, v_forest_values_p, tmp_idx_i)))
+                body.append(("valu", ("+", r["node"], v_forest_values_p, r["idx"])))
                 for offset in range(8):
-                    # scratch[tmp_node_val_i + offset] = mem[scratch[tmp_addr_i + offset]]
-                    body.append(("load", ("load_offset", tmp_node_val_i, tmp_addr_i, offset)))
-                body.append(("debug", ("vcompare", tmp_node_val_i, self.debug_vkeys(round, i, "node_val"))))
+                    # scratch[node + offset] = mem[scratch[node + offset]]
+                    body.append(("load", ("load_offset", r["node"], r["node"], offset)))
+                body.append(("debug", ("vcompare", r["node"], self.debug_vkeys(round, block_start, "node_val"))))
 
                 # val = myhash(val ^ node_val)
-                body.append(("valu", ("^", tmp_val_i, tmp_val_i, tmp_node_val_i)))
-                body.extend(self.build_hash(tmp_val_i, vtmp1, vtmp2, round, i))
-                body.append(("debug", ("vcompare", tmp_val_i, self.debug_vkeys(round, i, "hashed_val"))))
+                body.append(("valu", ("^", r["val"], r["val"], r["node"])))
+                # Node value are not used after the above op, we can re-use it as tmp2
+                body.extend(self.build_hash(r["val"], r["vtmp1"], r["node"], round, block_start))
+                body.append(("debug", ("vcompare", r["val"], self.debug_vkeys(round, block_start, "hashed_val"))))
 
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("valu", ("%", vtmp1, tmp_val_i, self.scratch_vconst(2))))
-                body.append(("valu", ("==", vtmp1, vtmp1, self.scratch_vconst(0))))
-                body.append(("flow", ("vselect", vtmp3, vtmp1, self.scratch_vconst(1), self.scratch_vconst(2))))
-                body.append(("valu", ("*", tmp_idx_i, tmp_idx_i, self.scratch_vconst(2))))
-                body.append(("valu", ("+", tmp_idx_i, tmp_idx_i, vtmp3)))
+                # idx = 2*idx + (1 if val % 2 == 0 else 2) simplified to the following
+                # bit = val & 1
+                # 2*idx + 1 + bit
+                body.append(("valu", ("multiply_add", r["idx"], r["idx"], self.scratch_vconst(2), self.scratch_vconst(1))))
+                body.append(("valu", ("&", r["vtmp1"], r["val"], self.scratch_vconst(1))))
+                body.append(("valu", ("+", r["idx"], r["idx"], r["vtmp1"])))
 
                 # idx = 0 if idx >= n_nodes else idx
-                body.append(("valu", ("<", vtmp1, tmp_idx_i, v_n_nodes)))
-                body.append(("flow", ("vselect", tmp_idx_i, vtmp1, tmp_idx_i, self.scratch_vconst(0))))
-                body.append(("debug", ("vcompare", tmp_idx_i, self.debug_vkeys(round, i, "wrapped_idx"))))
+                body.append(("valu", ("<", r["vtmp1"], r["idx"], v_n_nodes)))
+                body.append(("flow", ("vselect", r["idx"], r["vtmp1"], r["idx"], self.scratch_vconst(0))))
+                body.append(("debug", ("vcompare", r["idx"], self.debug_vkeys(round, block_start, "wrapped_idx"))))
 
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("vstore", tmp_addr, tmp_idx_i)))
+        for b, r in enumerate(regs):
+            block = self.scratch_const(b * VLEN)
+            # mem[inp_indices_p + block_idx * VLEN] = idx
+            # body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], block)))
+            # body.append(("store", ("vstore", tmp_addr, r["idx"])))
 
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("vstore", tmp_addr, tmp_val_i)))
+            # mem[inp_values_p + block_idx * VLEN] = val
+            body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], block)))
+            body.append(("store", ("vstore", tmp_addr, r["val"])))
 
         body_instrs = self.build(body)
         print("\nReport before scheduling: \n")
