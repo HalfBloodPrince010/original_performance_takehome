@@ -368,48 +368,62 @@ class KernelBuilder:
             body.append(("load", ("vload", r["val"], tmp_addr)))
             body.append(("debug", ("vcompare", r["val"], self.debug_vkeys(0, block_start, "val"))))
 
-        for round in range(rounds):
-            for b, r in enumerate(regs):
-                block_start = b * VLEN
+        # Generate different order, where the order of between rounds is still maintained,
+        # some blocks are executed later
+        # Currently, for round 1 and 2, all the gathers are removed, most ops are valu.
+        # We have round 1 and 2 for all the 32 blocks which has just valu ops
+        # FCFS scheduler scans ops in order, and starts packing the valu first
+        # As a result, for other rounds which does gather, can't proceed because the
+        # address generation happens with "valu" which is not available.
+        # ``` body.append(("valu", ("+", r["node"], forest_values_level[level], r["idx"]))) ```
+        # The below logic re-orders by delaying some of the blocks, but dependency between
+        # rounds is still maintained
+        order = sorted([(3 * r + b, r, b) for r in range(rounds) for b in range(n_blocks)])
+        print("Order\n")
+        print("\t", order)
 
-                # node_val = mem[forest_values_p + idx], gather op
-                # we can't use one pointer
-                level = round % (forest_height + 1)
-                if level == 0:
-                    body.append(("debug", ("vcompare", root_vec, self.debug_vkeys(round, block_start, "node_val"))))
-                    body.append(("valu", ("^", r["val"], r["val"], root_vec)))
-                elif level == 1:
-                    body.append(("valu", ("multiply_add", r["node"], r["idx"], delta_vec, left_node_vec)))
-                    body.append(("debug", ("vcompare", r["node"], self.debug_vkeys(round, block_start, "node_val"))))
-                    body.append(("valu", ("^", r["val"], r["val"], r["node"])))
-                else:
-                    body.append(("valu", ("+", r["node"], forest_values_level[level], r["idx"])))
-                    for offset in range(8):
-                        # scratch[node + offset] = mem[scratch[node + offset]]
-                        body.append(("load", ("load_offset", r["node"], r["node"], offset)))
-                    body.append(("debug", ("vcompare", r["node"], self.debug_vkeys(round, block_start, "node_val"))))
-                    # val = myhash(val ^ node_val)
-                    body.append(("valu", ("^", r["val"], r["val"], r["node"])))
+        for _, round, b in order:
+            r = regs[b]
+            block_start = b * VLEN
 
-                # Node value are not used after the above op, we can re-use it as tmp2
-                body.extend(self.build_hash(r["val"], r["vtmp1"], r["node"], round, block_start))
-                body.append(("debug", ("vcompare", r["val"], self.debug_vkeys(round, block_start, "hashed_val"))))
+            # node_val = mem[forest_values_p + idx], gather op
+            # we can't use one pointer
+            level = round % (forest_height + 1)
+            if level == 0:
+                body.append(("debug", ("vcompare", root_vec, self.debug_vkeys(round, block_start, "node_val"))))
+                body.append(("valu", ("^", r["val"], r["val"], root_vec)))
+            elif level == 1:
+                body.append(("valu", ("multiply_add", r["node"], r["idx"], delta_vec, left_node_vec)))
+                body.append(("debug", ("vcompare", r["node"], self.debug_vkeys(round, block_start, "node_val"))))
+                body.append(("valu", ("^", r["val"], r["val"], r["node"])))
+            else:
+                body.append(("valu", ("+", r["node"], forest_values_level[level], r["idx"])))
+                for offset in range(8):
+                    # scratch[node + offset] = mem[scratch[node + offset]]
+                    body.append(("load", ("load_offset", r["node"], r["node"], offset)))
+                body.append(("debug", ("vcompare", r["node"], self.debug_vkeys(round, block_start, "node_val"))))
+                # val = myhash(val ^ node_val)
+                body.append(("valu", ("^", r["val"], r["val"], r["node"])))
 
-                # idx = 2*idx + (1 if val % 2 == 0 else 2) simplified to the following
-                # bit = val & 1
-                # 2*idx + 1 + bit
-                # At Level 0: which is Round = 0 or 11
-                # save only bit because idx will be 0 anyway
-                if level == 0:
-                    body.append(("valu", ("&", r["idx"], r["val"], self.scratch_vconst(1))))
-                # We don't use this value anyway as it gets wrapped the next level, and directly use root_vec
-                elif level == forest_height:
-                    pass
-                # Other Rounds
-                # save only t = 2 * idx + bit
-                else:
-                    body.append(("valu", ("&", r["vtmp1"], r["val"], self.scratch_vconst(1))))
-                    body.append(("valu", ("multiply_add", r["idx"], r["idx"], self.scratch_vconst(2), r["vtmp1"])))
+            # Node value are not used after the above op, we can re-use it as tmp2
+            body.extend(self.build_hash(r["val"], r["vtmp1"], r["node"], round, block_start))
+            body.append(("debug", ("vcompare", r["val"], self.debug_vkeys(round, block_start, "hashed_val"))))
+
+            # idx = 2*idx + (1 if val % 2 == 0 else 2) simplified to the following
+            # bit = val & 1
+            # 2*idx + 1 + bit
+            # At Level 0: which is Round = 0 or 11
+            # save only bit because idx will be 0 anyway
+            if level == 0:
+                body.append(("valu", ("&", r["idx"], r["val"], self.scratch_vconst(1))))
+            # We don't use this value anyway as it gets wrapped the next level, and directly use root_vec
+            elif level == forest_height:
+                pass
+            # Other Rounds
+            # save only t = 2 * idx + bit
+            else:
+                body.append(("valu", ("&", r["vtmp1"], r["val"], self.scratch_vconst(1))))
+                body.append(("valu", ("multiply_add", r["idx"], r["idx"], self.scratch_vconst(2), r["vtmp1"])))
 
         for b, r in enumerate(regs):
             block = self.scratch_const(b * VLEN)
@@ -429,7 +443,7 @@ class KernelBuilder:
         body_instrs = self.scheduler_fcfs(self.setup + body)
         print("\nReport after scheduling: \n")
         self.report(body_instrs)
-        self.show(body_instrs, 0, 20)
+        self.show(body_instrs, 0, 100)
 
         self.instrs.extend(body_instrs)
         # Required to match with the yield in reference_kernel2
