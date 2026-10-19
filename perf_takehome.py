@@ -89,6 +89,16 @@ class KernelBuilder:
             self.vconst_map[val] = addr
         return self.vconst_map[val]
 
+    def tree_node_vec(self, node, name, tmp_addr):
+        n = self.alloc_scratch(name)
+        self.setup.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], self.scratch_const(node))))
+        self.setup.append(("load", ("load", n, tmp_addr)))
+        n_vec = self.alloc_scratch(f"{name}_vec", 8)
+        self.setup.append(("valu", ("vbroadcast", n_vec, n)))
+
+        return n_vec
+
+
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
 
@@ -290,10 +300,21 @@ class KernelBuilder:
             for block in range(n_blocks)
         ]
 
-        # Shared 8 vtmp2 across 32 blocks - block % 8
-        shared_vtmp = [
+        SETS = 2
+        # Shared vtmps - block % SETS
+        shared_vtmp2 = [
             self.alloc_scratch(f"vtmp2_{b}", 8)
-            for b in range(8)
+            for b in range(SETS)
+        ]
+
+        shared_vtmp3 = [
+            self.alloc_scratch(f"vtmp3_{b}", 8)
+            for b in range(SETS)
+        ]
+
+        shared_vtmp4 = [
+            self.alloc_scratch(f"vtmp4_{b}", 8)
+            for b in range(SETS)
         ]
 
         # Strength Reduction
@@ -346,50 +367,35 @@ class KernelBuilder:
         # If sign = 1,
         #        node = left_node + delta = right_node
         #
-        # Left Node
-        left_node = self.alloc_scratch("left_node")
-        self.setup.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], self.scratch_const(1))))
-        self.setup.append(("load", ("load", left_node, tmp_addr)))
-        left_node_vec = self.alloc_scratch("left_node_vec", 8)
-        self.setup.append(("valu", ("vbroadcast", left_node_vec, left_node)))
-        # Right Node
-        right_node = self.alloc_scratch("right_node")
-        self.setup.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], self.scratch_const(2))))
-        self.setup.append(("load", ("load", right_node, tmp_addr)))
-        right_node_vec = self.alloc_scratch("right_node_vec", 8)
-        self.setup.append(("valu", ("vbroadcast", right_node_vec, right_node)))
-        # Delta right_node_vec - left_node_vec
+        # Node 1 - 2
+        n1_vec = self.tree_node_vec(1, "n1", tmp_addr)
+        n2_vec = self.tree_node_vec(2, "n2", tmp_addr)
+        # Delta N2 - N1
         delta_vec = self.alloc_scratch("delta", 8)
-        self.setup.append(("valu", ("-", delta_vec, right_node_vec, left_node_vec)))
+        self.setup.append(("valu", ("-", delta_vec, n2_vec, n1_vec)))
 
         # LEVEL 2 Optimization
-        # n3
-        n3 = self.alloc_scratch("n3")
-        self.setup.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], self.scratch_const(3))))
-        self.setup.append(("load", ("load", n3, tmp_addr)))
-        n3_vec = self.alloc_scratch("n3_vec", 8)
-        self.setup.append(("valu", ("vbroadcast", n3_vec, n3)))
+        # Node 3 - 6
+        n3_vec = self.tree_node_vec(3, "n3", tmp_addr)
+        n4_vec = self.tree_node_vec(4, "n4", tmp_addr)
+        n5_vec = self.tree_node_vec(5, "n5", tmp_addr)
+        n6_vec = self.tree_node_vec(6, "n6", tmp_addr)
 
-        # n4
-        n4 = self.alloc_scratch("n4")
-        self.setup.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], self.scratch_const(4))))
-        self.setup.append(("load", ("load", n4, tmp_addr)))
-        n4_vec = self.alloc_scratch("n4_vec", 8)
-        self.setup.append(("valu", ("vbroadcast", n4_vec, n4)))
-
-        # n5
-        n5 = self.alloc_scratch("n5")
-        self.setup.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], self.scratch_const(5))))
-        self.setup.append(("load", ("load", n5, tmp_addr)))
-        n5_vec = self.alloc_scratch("n5_vec", 8)
-        self.setup.append(("valu", ("vbroadcast", n5_vec, n5)))
-
-        # n6
-        n6 = self.alloc_scratch("n6")
-        self.setup.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], self.scratch_const(6))))
-        self.setup.append(("load", ("load", n6, tmp_addr)))
-        n6_vec = self.alloc_scratch("n6_vec", 8)
-        self.setup.append(("valu", ("vbroadcast", n6_vec, n6)))
+        # LEVEL 3 Optimization
+        # Node 7 - 14
+        # t = b2 b1 b0
+        # b0 - 3rd choice, b1 - 2nd choice, b2 - 1st choice
+        # p0 = b0 ? n8: n7, p1 = b0 ? b10: n9, p2 = b0 ? n12: n11, p3 = b0 ? n14: n13
+        # left = b1? p1: p0, right = b1? p3: p2
+        # b2? right: left
+        n7_vec = self.tree_node_vec(7, "n7", tmp_addr)
+        n8_vec = self.tree_node_vec(8, "n8", tmp_addr)
+        n9_vec = self.tree_node_vec(9, "n9", tmp_addr)
+        n10_vec = self.tree_node_vec(10, "n10", tmp_addr)
+        n11_vec = self.tree_node_vec(11, "n11", tmp_addr)
+        n12_vec = self.tree_node_vec(12, "n12", tmp_addr)
+        n13_vec = self.tree_node_vec(13, "n13", tmp_addr)
+        n14_vec = self.tree_node_vec(14, "n14", tmp_addr)
 
         body = []  # array of slots
         for b, r in enumerate(regs):
@@ -422,6 +428,10 @@ class KernelBuilder:
         for _, round, b in order:
             r = regs[b]
             block_start = b * VLEN
+            s2 = shared_vtmp2[b % SETS]
+            s3 = shared_vtmp3[b % SETS]
+            s4 = shared_vtmp4[b % SETS]
+
 
             # node_val = mem[forest_values_p + idx], gather op
             # we can't use one pointer
@@ -430,7 +440,7 @@ class KernelBuilder:
                 body.append(("debug", ("vcompare", root_vec, self.debug_vkeys(round, block_start, "node_val"))))
                 body.append(("valu", ("^", r["val"], r["val"], root_vec)))
             elif level == 1:
-                body.append(("valu", ("multiply_add", r["node"], r["idx"], delta_vec, left_node_vec)))
+                body.append(("valu", ("multiply_add", r["node"], r["idx"], delta_vec, n1_vec)))
                 body.append(("debug", ("vcompare", r["node"], self.debug_vkeys(round, block_start, "node_val"))))
                 body.append(("valu", ("^", r["val"], r["val"], r["node"])))
             elif level == 2:
@@ -439,12 +449,38 @@ class KernelBuilder:
                 # Node if it's in the left subtree - b0 = 1? n4 : n3
                 body.append(("flow",("vselect", r["node"], r["vtmp1"], n4_vec, n3_vec)))
                 # Node if it's in the right subtree - b0 = 1? n6 : n5
-                body.append(("flow",("vselect", shared_vtmp[b % 8], r["vtmp1"], n6_vec, n5_vec)))
+                body.append(("flow",("vselect", s2, r["vtmp1"], n6_vec, n5_vec)))
                 # b1 - first choice
                 # If b0 = 0, b1 = 1 ? n5 : n3
                 body.append(("valu",(">>", r["vtmp1"], r["idx"], self.scratch_vconst(1))))
-                body.append(("flow",("vselect", r["node"], r["vtmp1"], shared_vtmp[b % 8], r["node"])))
+                body.append(("flow",("vselect", r["node"], r["vtmp1"], s2, r["node"])))
                 body.append(("valu", ("^", r["val"], r["val"], r["node"])))
+            elif level == 3:
+                # bit 0
+                body.append(("valu",("&", r["vtmp1"], r["idx"], self.scratch_vconst(1))))
+                # p0
+                body.append(("flow",("vselect", r["node"], r["vtmp1"], n8_vec, n7_vec)))
+                # p1
+                body.append(("flow",("vselect", s2, r["vtmp1"], n10_vec, n9_vec)))
+                # bit 1
+                body.append(("valu",(">>", s3 , r["idx"], self.scratch_vconst(1))))
+                body.append(("valu",("&", s3 , s3, self.scratch_vconst(1))))
+                # left = b1? p1: p0
+                body.append(("flow",("vselect", r["node"], s3, s2, r["node"])))
+
+                # p3
+                body.append(("flow",("vselect", s2, r["vtmp1"], n12_vec, n11_vec)))
+                # p4
+                body.append(("flow",("vselect", s4, r["vtmp1"], n14_vec, n13_vec)))
+                # right = b1? p3: p2
+                body.append(("flow",("vselect", s2, s3, s4, s2)))
+
+                # bit 2
+                body.append(("valu",(">>", r["vtmp1"] , r["idx"], self.scratch_vconst(2))))
+                # b2? right: left
+                body.append(("flow",("vselect", r["node"], r["vtmp1"],  s2, r["node"])))
+                body.append(("valu", ("^", r["val"], r["val"], r["node"])))
+
             else:
                 body.append(("valu", ("+", r["node"], forest_values_level[level], r["idx"])))
                 for offset in range(8):
