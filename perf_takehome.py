@@ -39,6 +39,7 @@ from problem import (
 )
 
 
+
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
@@ -89,10 +90,10 @@ class KernelBuilder:
             self.vconst_map[val] = addr
         return self.vconst_map[val]
 
-    def tree_node_vec(self, node, name, tmp_addr):
+    def tree_node_vec(self, node, name):
         n = self.alloc_scratch(name)
-        self.setup.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], self.scratch_const(node))))
-        self.setup.append(("load", ("load", n, tmp_addr)))
+        self.setup.append(("alu", ("+", n, self.scratch["forest_values_p"], self.scratch_const(node))))
+        self.setup.append(("load", ("load", n, n)))
         n_vec = self.alloc_scratch(f"{name}_vec", 8)
         self.setup.append(("valu", ("vbroadcast", n_vec, n)))
 
@@ -285,10 +286,11 @@ class KernelBuilder:
         self.add("debug", ("comment", "Starting loop"))
 
         # Setup
-        # Scalar scratch registers
-        tmp_addr = self.alloc_scratch("tmp_addr")
-
         n_blocks:int  = batch_size // VLEN
+        block_addr = {}
+        for b in range(n_blocks):
+            block_addr[b] = self.alloc_scratch(f"block_addr_{b}")
+
         # Vector scratch registers for each block
         # batch_size // VLEN = 256 // 8 = 32 blocks
         # 32 * 32 = 1024 scratch cells
@@ -300,21 +302,19 @@ class KernelBuilder:
             for block in range(n_blocks)
         ]
 
-        SETS = 2
-        # Shared vtmps - block % SETS
+        N_TEMP_SETS = 4
+        # Shared vtmps - block % N_TEMP_SETS
         shared_vtmp2 = [
             self.alloc_scratch(f"vtmp2_{b}", 8)
-            for b in range(SETS)
+            for b in range(N_TEMP_SETS)
         ]
-
         shared_vtmp3 = [
             self.alloc_scratch(f"vtmp3_{b}", 8)
-            for b in range(SETS)
+            for b in range(N_TEMP_SETS)
         ]
-
         shared_vtmp4 = [
             self.alloc_scratch(f"vtmp4_{b}", 8)
-            for b in range(SETS)
+            for b in range(N_TEMP_SETS)
         ]
 
         # Strength Reduction
@@ -337,20 +337,18 @@ class KernelBuilder:
         # gap + 1 =  2 ^ L
         # Hence, gap = 2^L - 1.
         forest_values_level = {}
-        for L in range(forest_height + 1):
+        for L in range(4, forest_height + 1):
             gap = (1 << L) - 1
             # forest_values_p + idx = forest_values_p + t + gap
             # We could precompute forest_values_p + gap, and t get saved at the end
             # instead of idx
-            forest_values_base_corrected = self.alloc_scratch(f"forest_values_p_{L}")
-            self.setup.append(("alu", ("+", forest_values_base_corrected, self.scratch[f"forest_values_p"], self.scratch_const(gap))))
-            forest_values_level[L] = self.alloc_scratch(f"v_forest_values_{L}", 8)
-            self.setup.append(("valu", ("vbroadcast", forest_values_level[L], forest_values_base_corrected)))
+            forest_values_level[L] = self.alloc_scratch(f"forest_values_p_{L}")
+            self.setup.append(("alu", ("+", self.scratch[f"forest_values_p_{L}"], self.scratch[f"forest_values_p"], self.scratch_const(gap))))
 
         # LEVEL 0 Optimization
         # At Round 0 and 11, all idx start at 0, we don't have to gather for every idx
-        # Round 0 - Tree level = 0
-        # Round 11 - Tree level =  11 = forest_height + 1, we wrap to 0.
+        # Round 0 - level = 0
+        # Round 11 is level 0: 11 % (forest_height + 1) = 0 (wrap to the root)
         root = self.alloc_scratch("root", 1)
         self.setup.append(("load", ("load", root, self.scratch["forest_values_p"])))
         root_vec = self.alloc_scratch("root_vec", 8)
@@ -368,18 +366,18 @@ class KernelBuilder:
         #        node = left_node + delta = right_node
         #
         # Node 1 - 2
-        n1_vec = self.tree_node_vec(1, "n1", tmp_addr)
-        n2_vec = self.tree_node_vec(2, "n2", tmp_addr)
+        n1_vec = self.tree_node_vec(1, "n1")
+        n2_vec = self.tree_node_vec(2, "n2")
         # Delta N2 - N1
         delta_vec = self.alloc_scratch("delta", 8)
         self.setup.append(("valu", ("-", delta_vec, n2_vec, n1_vec)))
 
         # LEVEL 2 Optimization
         # Node 3 - 6
-        n3_vec = self.tree_node_vec(3, "n3", tmp_addr)
-        n4_vec = self.tree_node_vec(4, "n4", tmp_addr)
-        n5_vec = self.tree_node_vec(5, "n5", tmp_addr)
-        n6_vec = self.tree_node_vec(6, "n6", tmp_addr)
+        n3_vec = self.tree_node_vec(3, "n3")
+        n4_vec = self.tree_node_vec(4, "n4")
+        n5_vec = self.tree_node_vec(5, "n5")
+        n6_vec = self.tree_node_vec(6, "n6")
 
         # LEVEL 3 Optimization
         # Node 7 - 14
@@ -388,64 +386,66 @@ class KernelBuilder:
         # p0 = b0 ? n8: n7, p1 = b0 ? b10: n9, p2 = b0 ? n12: n11, p3 = b0 ? n14: n13
         # left = b1? p1: p0, right = b1? p3: p2
         # b2? right: left
-        n7_vec = self.tree_node_vec(7, "n7", tmp_addr)
-        n8_vec = self.tree_node_vec(8, "n8", tmp_addr)
-        n9_vec = self.tree_node_vec(9, "n9", tmp_addr)
-        n10_vec = self.tree_node_vec(10, "n10", tmp_addr)
-        n11_vec = self.tree_node_vec(11, "n11", tmp_addr)
-        n12_vec = self.tree_node_vec(12, "n12", tmp_addr)
-        n13_vec = self.tree_node_vec(13, "n13", tmp_addr)
-        n14_vec = self.tree_node_vec(14, "n14", tmp_addr)
+        n7_vec = self.tree_node_vec(7, "n7")
+        n8_vec = self.tree_node_vec(8, "n8")
+        n9_vec = self.tree_node_vec(9, "n9")
+        n10_vec = self.tree_node_vec(10, "n10")
+        n11_vec = self.tree_node_vec(11, "n11")
+        n12_vec = self.tree_node_vec(12, "n12")
+        n13_vec = self.tree_node_vec(13, "n13")
+        n14_vec = self.tree_node_vec(14, "n14")
 
         body = []  # array of slots
         for b, r in enumerate(regs):
             block_start = b * VLEN
             block = self.scratch_const(block_start)
             # idx = mem[inp_indices_p + block_start]
-            body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], block)))
-            body.append(("load", ("vload", r["idx"], tmp_addr)))
+            body.append(("alu", ("+", block_addr[b], self.scratch["inp_indices_p"], block)))
+            body.append(("load", ("vload", r["idx"], block_addr[b])))
             body.append(("debug", ("vcompare", r["idx"], self.debug_vkeys(0, block_start, "idx"))))
 
             # val = mem[inp_values_p + block_start]
-            body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], block)))
-            body.append(("load", ("vload", r["val"], tmp_addr)))
+            body.append(("alu", ("+", block_addr[b], self.scratch["inp_values_p"], block)))
+            body.append(("load", ("vload", r["val"], block_addr[b])))
             body.append(("debug", ("vcompare", r["val"], self.debug_vkeys(0, block_start, "val"))))
 
-        # Generate different order, where the order of between rounds is still maintained,
-        # some blocks are executed later
-        # Currently, for round 1 and 2, all the gathers are removed, most ops are valu.
-        # We have round 1 and 2 for all the 32 blocks which has just valu ops
-        # FCFS scheduler scans ops in order, and starts packing the valu first
-        # As a result, for other rounds which does gather, can't proceed because the
-        # address generation happens with "valu" which is not available.
-        # ``` body.append(("valu", ("+", r["node"], forest_values_level[level], r["idx"]))) ```
-        # The below logic re-orders by delaying some of the blocks, but dependency between
-        # rounds is still maintained
+        # Reorder instructions across rounds and blocks to improve scheduling efficiency.
+        #
+        # The Level 1, 2 and 3 optimizations eliminate gather operations, leaving
+        # these rounds dominated by VALU instructions. When processing all 32 blocks
+        # sequentially, the FCFS scheduler prioritizes packing these VALU operations,
+        # saturating the available VALU slots.
+        #
+        # This delays later rounds that require memory gathers, since their address
+        # generation also depends on arithmetic instructions.
+        #
+        # To avoid this bottleneck, interleave rounds across blocks using (2 * r + b).
+        # This delays block execution, allowing later rounds with memory operations
+        # to overlap with earlier rounds that are primarily compute-bound.
+        #
+        # The relative order of rounds within each block is preserved, ensuring that
+        # dependencies between consecutive rounds remain intact.
         order = sorted([(2 * r + b, r, b) for r in range(rounds) for b in range(n_blocks)])
-        print("Order\n")
-        print("\t", order)
 
         for _, round, b in order:
             r = regs[b]
             block_start = b * VLEN
-            s2 = shared_vtmp2[b % SETS]
-            s3 = shared_vtmp3[b % SETS]
-            s4 = shared_vtmp4[b % SETS]
-
-
-            # node_val = mem[forest_values_p + idx], gather op
-            # we can't use one pointer
+            s2 = shared_vtmp2[b % N_TEMP_SETS]
+            s3 = shared_vtmp3[b % N_TEMP_SETS]
+            s4 = shared_vtmp4[b % N_TEMP_SETS]
             level = round % (forest_height + 1)
+
             if level == 0:
                 body.append(("debug", ("vcompare", root_vec, self.debug_vkeys(round, block_start, "node_val"))))
                 body.append(("valu", ("^", r["val"], r["val"], root_vec)))
             elif level == 1:
                 body.append(("valu", ("multiply_add", r["node"], r["idx"], delta_vec, n1_vec)))
                 body.append(("debug", ("vcompare", r["node"], self.debug_vkeys(round, block_start, "node_val"))))
-                body.append(("valu", ("^", r["val"], r["val"], r["node"])))
+                # val = myhash(val ^ node_val)
+                for j in range(VLEN):
+                    body.append(("alu", ("^", r["val"] + j, r["val"] + j, r["node"] + j)))
             elif level == 2:
-                # b0 - second choice
-                body.append(("valu",("&", r["vtmp1"], r["idx"], self.scratch_vconst(1))))
+                body.append(("valu",("&", r["vtmp1"], r["idx"], self.scratch_vconst(1)))) # b0 - second choice
                 # Node if it's in the left subtree - b0 = 1? n4 : n3
                 body.append(("flow",("vselect", r["node"], r["vtmp1"], n4_vec, n3_vec)))
                 # Node if it's in the right subtree - b0 = 1? n6 : n5
@@ -454,7 +454,9 @@ class KernelBuilder:
                 # If b0 = 0, b1 = 1 ? n5 : n3
                 body.append(("valu",(">>", r["vtmp1"], r["idx"], self.scratch_vconst(1))))
                 body.append(("flow",("vselect", r["node"], r["vtmp1"], s2, r["node"])))
-                body.append(("valu", ("^", r["val"], r["val"], r["node"])))
+                # val = myhash(val ^ node_val)
+                for j in range(VLEN):
+                    body.append(("alu", ("^", r["val"] + j, r["val"] + j, r["node"] + j)))
             elif level == 3:
                 # bit 0
                 body.append(("valu",("&", r["vtmp1"], r["idx"], self.scratch_vconst(1))))
@@ -467,28 +469,30 @@ class KernelBuilder:
                 body.append(("valu",("&", s3 , s3, self.scratch_vconst(1))))
                 # left = b1? p1: p0
                 body.append(("flow",("vselect", r["node"], s3, s2, r["node"])))
-
                 # p3
                 body.append(("flow",("vselect", s2, r["vtmp1"], n12_vec, n11_vec)))
                 # p4
                 body.append(("flow",("vselect", s4, r["vtmp1"], n14_vec, n13_vec)))
                 # right = b1? p3: p2
                 body.append(("flow",("vselect", s2, s3, s4, s2)))
-
                 # bit 2
                 body.append(("valu",(">>", r["vtmp1"] , r["idx"], self.scratch_vconst(2))))
                 # b2? right: left
                 body.append(("flow",("vselect", r["node"], r["vtmp1"],  s2, r["node"])))
-                body.append(("valu", ("^", r["val"], r["val"], r["node"])))
-
+                # val = myhash(val ^ node_val)
+                for j in range(VLEN):
+                    body.append(("alu", ("^", r["val"] + j, r["val"] + j, r["node"] + j)))
             else:
-                body.append(("valu", ("+", r["node"], forest_values_level[level], r["idx"])))
+                for j in range(VLEN):
+                    body.append(("alu", ("+", r["node"] + j, forest_values_level[level], r["idx"] + j)))
+                # GATHER
                 for offset in range(8):
                     # scratch[node + offset] = mem[scratch[node + offset]]
                     body.append(("load", ("load_offset", r["node"], r["node"], offset)))
                 body.append(("debug", ("vcompare", r["node"], self.debug_vkeys(round, block_start, "node_val"))))
                 # val = myhash(val ^ node_val)
-                body.append(("valu", ("^", r["val"], r["val"], r["node"])))
+                for j in range(VLEN):
+                    body.append(("alu", ("^", r["val"] + j, r["val"] + j, r["node"] + j)))
 
             # Node value are not used after the above op, we can re-use it as tmp2
             body.extend(self.build_hash(r["val"], r["vtmp1"], r["node"], round, block_start))
@@ -497,36 +501,26 @@ class KernelBuilder:
             # idx = 2*idx + (1 if val % 2 == 0 else 2) simplified to the following
             # bit = val & 1
             # 2*idx + 1 + bit
-            # At Level 0: which is Round = 0 or 11
-            # save only bit because idx will be 0 anyway
+            # At Level 0: Save only bit because idx will be 0 anyway
             if level == 0:
-                body.append(("valu", ("&", r["idx"], r["val"], self.scratch_vconst(1))))
-            # We don't use this value anyway as it gets wrapped the next level, and directly use root_vec
+                for j in range(VLEN):
+                    body.append(("alu", ("&", r["idx"] + j, r["val"] + j, self.scratch_const(1))))
             elif level == forest_height:
+                # We don't use this value anyway as it gets wrapped the next level, and directly use root_vec
                 pass
-            # Other Rounds
-            # save only t = 2 * idx + bit
             else:
-                body.append(("valu", ("&", r["vtmp1"], r["val"], self.scratch_vconst(1))))
+                for j in range(VLEN):
+                   body.append(("alu", ("&", r["vtmp1"] + j, r["val"] + j, self.scratch_const(1))))
                 body.append(("valu", ("multiply_add", r["idx"], r["idx"], self.scratch_vconst(2), r["vtmp1"])))
 
         for b, r in enumerate(regs):
             block = self.scratch_const(b * VLEN)
-            # mem[inp_indices_p + block_idx * VLEN] = idx
-            # body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], block)))
-            # body.append(("store", ("vstore", tmp_addr, r["idx"])))
-
             # mem[inp_values_p + block_idx * VLEN] = val
-            body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], block)))
-            body.append(("store", ("vstore", tmp_addr, r["val"])))
-
-        body_instrs = self.build(self.setup + body)
-        print("\nReport before scheduling: \n")
-        self.report(body_instrs)
-        self.show(body_instrs, 0, 20)
+            body.append(("alu", ("+", block_addr[b], self.scratch["inp_values_p"], block)))
+            body.append(("store", ("vstore", block_addr[b], r["val"])))
 
         body_instrs = self.scheduler_fcfs(self.setup + body)
-        print("\nReport after scheduling: \n")
+        print("Report after scheduling: ")
         self.report(body_instrs)
         self.show(body_instrs, 0, 100)
 
