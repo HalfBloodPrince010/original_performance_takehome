@@ -99,6 +99,40 @@ class KernelBuilder:
 
         return n_vec
 
+    def setup_gather_elimination_optimization(self):
+        # LEVEL 0 Optimization
+        # At Round 0 and 11, all idx start at 0, we don't have to gather for every idx
+        # Round 0 - level = 0
+        # Round 11 is level 0: 11 % (forest_height + 1) = 0 (wrap to the root)
+        root = self.alloc_scratch("root", 1)
+        self.setup.append(("load", ("load", root, self.scratch["forest_values_p"])))
+        root_vec = self.alloc_scratch("root_vec", 8)
+        self.setup.append(("valu", ("vbroadcast", root_vec, root)))
+
+        # LEVEL 1 Optimization
+        # Node 1 - 2
+        n1_vec = self.tree_node_vec(1, "n1")
+        n2_vec = self.tree_node_vec(2, "n2")
+        # Delta N2 - N1
+        delta_vec = self.alloc_scratch("delta", 8)
+        self.setup.append(("valu", ("-", delta_vec, n2_vec, n1_vec)))
+
+        # LEVEL 2 Optimization
+        # Node 3 - 6
+        level2_nodes = [
+            self.tree_node_vec(node, f"n{node}")
+            for node in range(3, 7)
+        ]
+
+        # LEVEL 3 Optimization
+        # Node 7 - 14
+        level3_nodes = [
+            self.tree_node_vec(node, f"n{node}")
+            for node in range(7, 15)
+        ]
+
+        return root_vec, delta_vec, n1_vec, n2_vec, level2_nodes, level3_nodes
+
 
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
@@ -345,55 +379,8 @@ class KernelBuilder:
             forest_values_level[L] = self.alloc_scratch(f"forest_values_p_{L}")
             self.setup.append(("alu", ("+", self.scratch[f"forest_values_p_{L}"], self.scratch[f"forest_values_p"], self.scratch_const(gap))))
 
-        # LEVEL 0 Optimization
-        # At Round 0 and 11, all idx start at 0, we don't have to gather for every idx
-        # Round 0 - level = 0
-        # Round 11 is level 0: 11 % (forest_height + 1) = 0 (wrap to the root)
-        root = self.alloc_scratch("root", 1)
-        self.setup.append(("load", ("load", root, self.scratch["forest_values_p"])))
-        root_vec = self.alloc_scratch("root_vec", 8)
-        self.setup.append(("valu", ("vbroadcast", root_vec, root)))
-
-        # LEVEL 1 Optimization
-        # Similarly, at Round 1 and 12, we are 1 level below root, so we have either
-        # left node or right node to choose from.
-        # Using the sign bit, we can update the values as
-        # node = left_node + s * delta
-        # where delta = right_node - left_node
-        # If sign = 0,
-        #        node = left_node + 0 = left_node
-        # If sign = 1,
-        #        node = left_node + delta = right_node
-        #
-        # Node 1 - 2
-        n1_vec = self.tree_node_vec(1, "n1")
-        n2_vec = self.tree_node_vec(2, "n2")
-        # Delta N2 - N1
-        delta_vec = self.alloc_scratch("delta", 8)
-        self.setup.append(("valu", ("-", delta_vec, n2_vec, n1_vec)))
-
-        # LEVEL 2 Optimization
-        # Node 3 - 6
-        n3_vec = self.tree_node_vec(3, "n3")
-        n4_vec = self.tree_node_vec(4, "n4")
-        n5_vec = self.tree_node_vec(5, "n5")
-        n6_vec = self.tree_node_vec(6, "n6")
-
-        # LEVEL 3 Optimization
-        # Node 7 - 14
-        # t = b2 b1 b0
-        # b0 - 3rd choice, b1 - 2nd choice, b2 - 1st choice
-        # p0 = b0 ? n8: n7, p1 = b0 ? b10: n9, p2 = b0 ? n12: n11, p3 = b0 ? n14: n13
-        # left = b1? p1: p0, right = b1? p3: p2
-        # b2? right: left
-        n7_vec = self.tree_node_vec(7, "n7")
-        n8_vec = self.tree_node_vec(8, "n8")
-        n9_vec = self.tree_node_vec(9, "n9")
-        n10_vec = self.tree_node_vec(10, "n10")
-        n11_vec = self.tree_node_vec(11, "n11")
-        n12_vec = self.tree_node_vec(12, "n12")
-        n13_vec = self.tree_node_vec(13, "n13")
-        n14_vec = self.tree_node_vec(14, "n14")
+        # Gather Elimination Optimization
+        root_vec, delta_vec, n1_vec, n2_vec, level2_nodes, level3_nodes = self.setup_gather_elimination_optimization()
 
         body = []  # array of slots
         for b, r in enumerate(regs):
@@ -447,9 +434,9 @@ class KernelBuilder:
             elif level == 2:
                 body.append(("valu",("&", r["vtmp1"], r["idx"], self.scratch_vconst(1)))) # b0 - second choice
                 # Node if it's in the left subtree - b0 = 1? n4 : n3
-                body.append(("flow",("vselect", r["node"], r["vtmp1"], n4_vec, n3_vec)))
+                body.append(("flow",("vselect", r["node"], r["vtmp1"], level2_nodes[1], level2_nodes[0])))
                 # Node if it's in the right subtree - b0 = 1? n6 : n5
-                body.append(("flow",("vselect", s2, r["vtmp1"], n6_vec, n5_vec)))
+                body.append(("flow",("vselect", s2, r["vtmp1"], level2_nodes[3], level2_nodes[2])))
                 # b1 - first choice
                 # If b0 = 0, b1 = 1 ? n5 : n3
                 body.append(("valu",(">>", r["vtmp1"], r["idx"], self.scratch_vconst(1))))
@@ -461,18 +448,18 @@ class KernelBuilder:
                 # bit 0
                 body.append(("valu",("&", r["vtmp1"], r["idx"], self.scratch_vconst(1))))
                 # p0
-                body.append(("flow",("vselect", r["node"], r["vtmp1"], n8_vec, n7_vec)))
+                body.append(("flow",("vselect", r["node"], r["vtmp1"], level3_nodes[1], level3_nodes[0])))
                 # p1
-                body.append(("flow",("vselect", s2, r["vtmp1"], n10_vec, n9_vec)))
+                body.append(("flow",("vselect", s2, r["vtmp1"], level3_nodes[3], level3_nodes[2])))
                 # bit 1
                 body.append(("valu",(">>", s3 , r["idx"], self.scratch_vconst(1))))
                 body.append(("valu",("&", s3 , s3, self.scratch_vconst(1))))
                 # left = b1? p1: p0
                 body.append(("flow",("vselect", r["node"], s3, s2, r["node"])))
                 # p3
-                body.append(("flow",("vselect", s2, r["vtmp1"], n12_vec, n11_vec)))
+                body.append(("flow",("vselect", s2, r["vtmp1"], level3_nodes[5], level3_nodes[4])))
                 # p4
-                body.append(("flow",("vselect", s4, r["vtmp1"], n14_vec, n13_vec)))
+                body.append(("flow",("vselect", s4, r["vtmp1"], level3_nodes[7], level3_nodes[6])))
                 # right = b1? p3: p2
                 body.append(("flow",("vselect", s2, s3, s4, s2)))
                 # bit 2
